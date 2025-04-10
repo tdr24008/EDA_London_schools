@@ -1,0 +1,890 @@
+
+---
+title: "London Schools Analysis"
+author: "Tom Richardson"
+date: "2025-03-29"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+required_packages <- c("tidyverse", "ggplot2", "GGally", "Rtsne", "scales",
+                       "naniar", "mice", "dplyr", "tidyr", "sf", "tmap", "stringr")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+
+```
+
+# Load and Explore Data
+
+```{r}
+df <- read_csv("london_schools_data.csv")
+glimpse(df)
+summary(df)
+```
+
+
+
+```{r miss-unaut-ofsted, echo=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(naniar)
+
+# Ensure 'ofsted' is a factor so missing rows aren't dropped
+df$ofsted <- as.factor(df$ofsted)
+
+# Plot missingness in pct_unaut_absence by Ofsted rating
+ggplot(df, aes(x = ofsted, y = pct_unaut_absence)) +
+  geom_miss_point(color = "black", color_miss = "red", alpha = 0.7) +
+  labs(
+    title = "Missingness of Unauthorised Absence by Ofsted Rating",
+    x = "Ofsted Rating",
+    y = "% Unauthorised Absence"
+  ) +
+  theme_minimal()
+
+# Create a copy of pct_unaut_absence: 0 if missing, else the actual value
+df_plot <- df %>%
+  mutate(
+    unaut_for_plot = ifelse(is.na(pct_unaut_absence), 0, pct_unaut_absence),
+    missing_unaut  = ifelse(is.na(pct_unaut_absence), "Missing", "Not Missing")
+  )
+
+# Plot borough (x-axis) vs unaut_for_plot (y-axis), color by missingness
+ggplot(df_plot, aes(x = borough, y = unaut_for_plot, color = missing_unaut)) +
+  geom_point(position = position_jitter(width = 0.25, height = 0), alpha = 0.7) +
+  labs(
+    title = "Unauthorised Absence by Borough (Missing vs. Not Missing)",
+    x = "Borough",
+    y = "Percent Unauthorised Absence (NA -> 0)"
+  ) +
+  scale_y_continuous(limits = c(0, 0.07)) +  # adjust if you have higher values
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+# Data Quality & Cleaning
+
+```{r}
+missing_summary <- df %>%
+  summarise(across(everything(), ~ mean(is.na(.) | . == ""))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_pct") %>%
+  arrange(desc(missing_pct))
+
+# Show variables with any kind of missing/blank/inapplicable data
+missing_summary %>%
+  filter(missing_pct > 0)
+
+
+# Visualise missingness (optional)
+library(naniar)
+vis_miss(df)
+
+# Drop variables with too much missing data (e.g., more than 30%)
+high_na_vars <- missing_summary %>%
+  filter(missing_pct > 0.3) %>%
+  pull(variable)
+
+df <- df %>% select(-all_of(high_na_vars))
+
+# For moderate missingness: drop rows with key variables missing
+df <- df %>% drop_na(pct_attainment, pct_fsm, pupils_per_teacher)
+
+# Check for extreme outliers with boxplots
+numeric_vars <- df %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything())
+
+ggplot(numeric_vars, aes(x = name, y = value)) +
+  geom_boxplot(outlier.color = "red") +
+  coord_flip() +
+  labs(title = "Outlier Check Across Numeric Variables")
+
+# Examine missingness of `school_type` vs `pct_fsm`
+ggplot(df, aes(x = pct_fsm, y = school_type)) +
+  geom_miss_point() +
+  labs(title = "Missingness of School Type by % FSM",
+       x = "% Free School Meals", y = "School Type")
+
+# Check missingness of `pct_unaut_absence` across boroughs
+ggplot(df, aes(x = borough, y = pct_unaut_absence)) +
+  geom_miss_point() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Missingness of Unauthorised Absence by Borough")
+
+
+# Make sure Ofsted is treated as a factor (categorical)
+# df$ofsted <- as.factor(df$ofsted)
+
+ggplot(df, aes(x = ofsted, y = pct_attainment)) +
+  geom_miss_point(color_miss = "red", color = "black", alpha = 0.7) +
+  labs(
+    title = "Missingness in Percent Attainment by Ofsted Ranking",
+    x = "Ofsted Rating",
+    y = "% Attainment"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+
+# Load packages
+
+# Define variables to impute
+vars_to_impute <- c(
+  "pct_attainment", "pct_absences", "pct_unaut_absence",
+  "pct_esl", "mean_distance",
+  "school_type", "denomination", "admissions_type"
+)
+
+# Subset and prepare data for imputation
+df_imp <- df %>%
+  select(all_of(vars_to_impute)) %>%
+  mutate(across(c(school_type, denomination, admissions_type), as.factor))
+
+# Define imputation methods
+imp_methods <- make.method(df_imp)
+imp_methods[c("school_type", "denomination", "admissions_type")] <- "polyreg"
+imp_methods[setdiff(names(imp_methods), c("school_type", "denomination", "admissions_type"))] <- "pmm"
+
+# Run multiple imputation
+imp <- mice(df_imp, m = 5, method = imp_methods, seed = 123)
+
+# Extract first completed dataset and restore names
+df_imputed <- complete(imp, 1)
+names(df_imputed) <- vars_to_impute  # Restore variable names
+
+#  Merge imputed values back into the full dataset
+df_filled <- df
+df_filled[vars_to_impute] <- df_imputed
+
+df <- df_filled
+# df_filled is now complete dataset with missing values imputed
+
+#  Flag inconsistencies
+df <- df %>%
+  mutate(
+    sum_gender_mismatch = (num_boys + num_girls) != num_pupils,
+    invalid_gender_single = case_when(
+      gender == "Girls" & num_boys > 0 ~ TRUE,
+      gender == "Boys" & num_girls > 0 ~ TRUE,
+      TRUE ~ FALSE
+    )
+  )
+
+# Step 2: Fix num_pupils where gender counts are valid
+df <- df %>%
+  mutate(
+    num_pupils = ifelse(sum_gender_mismatch & !is.na(num_boys) & !is.na(num_girls),
+                        num_boys + num_girls,
+                        num_pupils
+    )
+  )
+
+# Fix single-gender count inconsistencies
+df <- df %>%
+  mutate(
+    num_boys = ifelse(gender == "Girls", 0, num_boys),
+    num_girls = ifelse(gender == "Boys", 0, num_girls)
+  )
+
+# Recalculate boy_girl_r safely
+df <- df %>%
+  mutate(
+    boy_girl_r = ifelse(num_girls == 0, NA, num_boys / num_girls)
+  )
+
+# Clean up flags
+df <- df %>% select(-sum_gender_mismatch, -invalid_gender_single)
+
+# Remove rows where num_pupils is 0
+df <- df %>% filter(num_pupils != 0, pupils_per_teacher != 0)
+
+```
+
+```{r}
+
+# Select numeric columns (excluding 'urn')
+numeric_data <- df %>%
+  select(where(is.numeric)) %>%
+  select(-urn)
+
+# Calculate outlier bounds using the IQR method
+outlier_summary <- numeric_data %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  group_by(variable) %>%
+  summarise(
+    Q1 = quantile(value, 0.25, na.rm = TRUE),
+    Q3 = quantile(value, 0.75, na.rm = TRUE),
+    IQR = Q3 - Q1,
+    lower = Q1 - 1.5 * IQR,
+    upper = Q3 + 1.5 * IQR
+  ) %>%
+  left_join(
+    numeric_data %>%
+      pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+      group_by(variable) %>%
+      summarise(outlier_count = sum(
+        value < quantile(value, 0.25, na.rm = TRUE) - 1.5 * IQR(value, na.rm = TRUE) |
+        value > quantile(value, 0.75, na.rm = TRUE) + 1.5 * IQR(value, na.rm = TRUE),
+        na.rm = TRUE
+      )),
+    by = "variable"
+  ) %>%
+  arrange(desc(outlier_count))
+
+# Show outlier count table
+print(
+  knitr::kable(outlier_summary[, c("variable", "outlier_count")],
+               col.names = c("Variable", "Outlier Count"),
+               caption = "Number of Outliers per Numeric Variable (Excluding URN)")
+)
+
+DT::datatable(outlier_summary[, c("variable", "outlier_count")])
+
+```
+
+# General Visuals & Summary Stats
+
+```{r}
+# Histograms
+df %>%
+  ggplot(aes(x = num_pupils)) +
+  geom_histogram(binwidth = 50, fill = "steelblue") +
+  labs(title = "Distribution of Number of Pupils")
+
+df %>%
+  ggplot(aes(x = pct_attainment)) +
+  geom_histogram(binwidth = 0.05, fill = "darkgreen") +
+  labs(title = "Distribution of Percent Attainment")
+
+df %>%
+  ggplot(aes(x = pupils_per_teacher)) +
+  geom_histogram(binwidth = 0.5, fill = "purple") +
+  labs(title = "Pupils per Teacher")
+```
+
+# Choropleth maps
+
+```{r}
+library(sf)
+library(tidyverse)
+
+# Read all borough shapefiles
+
+# Set folder path
+shp_folder <- "london_boroughs"  
+
+# List only the .shp files
+shp_files <- list.files(shp_folder, pattern = "\\.shp$", full.names = TRUE)
+
+# Read and combine all shapefiles into one sf object
+borough_shapes <- map_df(shp_files, ~ {
+  st_read(.x, quiet = TRUE) %>%
+    mutate(borough = tools::file_path_sans_ext(basename(.x)))  # adds borough name from filename
+})
+
+#clean borough name formatting
+borough_shapes$borough <- str_replace_all(borough_shapes$borough, "_", " ") %>%
+  str_to_title() %>% str_trim()
+
+
+
+# Summarise data by borough (example: average pct_attainment)
+
+attainment_by_borough <- df %>%
+  group_by(borough) %>%
+  summarise(avg_attainment = mean(pct_attainment, na.rm = TRUE))
+
+# clean borough names to match shapefiles
+attainment_by_borough$borough <- str_to_title(str_trim(attainment_by_borough$borough))
+
+# Join spatial and school data 
+
+borough_map_data <- borough_shapes %>%
+  left_join(attainment_by_borough, by = "borough")
+
+# Plot choropleth map
+
+ggplot(borough_map_data) +
+  geom_sf(aes(fill = avg_attainment), color = "white", size = 0.3) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80", name = "% Attainment") +
+  labs(
+    title = "Average School Attainment by London Borough"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+```
+
+```{r}
+
+library(sf)
+library(tidyverse)
+
+# Read all borough shapefiles
+
+# Set folder path
+shp_folder <- "london_boroughs"  
+
+# List only the .shp files
+shp_files <- list.files(shp_folder, pattern = "\\.shp$", full.names = TRUE)
+
+# Read and combine all shapefiles into one sf object
+borough_shapes <- map_df(shp_files, ~ {
+  st_read(.x, quiet = TRUE) %>%
+    mutate(borough = tools::file_path_sans_ext(basename(.x)))  # adds borough name from filename
+})
+
+# clean borough name formatting
+borough_shapes$borough <- str_replace_all(borough_shapes$borough, "_", " ") %>%
+  str_to_title() %>% str_trim()
+
+# Group LSOA geometries into one polygon per borough
+borough_shapes_clean <- borough_shapes %>%
+  group_by(borough) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Summarise data by borough (example: average pct_attainment) 
+attainment_by_borough <- df %>%
+  group_by(borough) %>%
+  summarise(avg_attainment = mean(pct_attainment, na.rm = TRUE)) %>%
+  mutate(borough = str_to_title(str_trim(borough)))
+
+# Join spatial and school data 
+borough_map_data <- borough_shapes_clean %>%
+  left_join(attainment_by_borough, by = "borough")
+
+# Plot choropleth map 
+ggplot(borough_map_data) +
+  geom_sf(aes(fill = avg_attainment), color = "white", size = 0.3) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80", name = "% Attainment") +
+  labs(
+    title = "Average School Attainment by London Borough"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank())
+```
+
+
+# Attainment vs School Type / Gender
+
+```{r}
+ggplot(df, aes(x = gender, y = pct_attainment)) +
+  geom_boxplot(fill = "orange") +
+  labs(title = "Attainment by Gender")
+
+ggplot(df, aes(x = school_type, y = pct_attainment)) +
+  geom_boxplot(fill = "skyblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Attainment by School Type")
+```
+
+# Spatial Analysis
+
+```{r}
+ggplot(df, aes(x = lon, y = lat)) +
+  geom_point(alpha = 0.5, color = "red") +
+  coord_fixed() +
+  labs(title = "School Locations in London")
+
+ggplot(df, aes(x = fct_reorder(borough, pct_attainment, .fun = median), y = pct_attainment)) +
+  geom_boxplot(fill = "lightblue") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(
+    title = "Attainment by Borough",
+    x = "Boroughs",
+    y = "Percentage of Attainment"
+  )
+```
+
+# Deprivation vs Performance
+
+```{r}
+library(GGally)
+
+corr_vars <- df %>%
+  select(pct_fsm, income_score, education_skills_score, pct_attainment, ofsted) %>%
+  na.omit()
+
+ggpairs(corr_vars, title = "Deprivation vs Performance: Correlation Matrix")
+
+ggplot(df, aes(x = pct_fsm, y = pct_attainment)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred")
+
+ggplot(df, aes(x = education_skills_score, y = pct_attainment)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_smooth(method = "lm", se = FALSE, color = "black")
+
+ggplot(df, aes(x = factor(ofsted), y = pct_fsm)) +
+  geom_boxplot(fill = "orange") +
+  labs(title = "FSM % by OFSTED Rating")
+```
+
+# Clustering
+
+```{r}
+# Filter to complete cases
+# df_clust <- df %>%
+ # select(pct_fsm, income_score, education_skills_score, pct_attainment, pupils_per_teacher, ofsted) %>%
+ # %drop_na()
+
+# Save original rows used
+# df_used <- df[complete.cases(df[, c("pct_fsm", "income_score", "education_skills_score",
+#                                    "pct_attainment", "pupils_per_teacher", "ofsted")]), ]
+
+# Select all numeric columns, but exclude 'urn', 'lon', 'lat'
+df_clust <- df %>%
+  select(where(is.numeric)) %>%
+  select(-urn, -lon, -lat) %>%
+  drop_na()  # Listwise deletion
+
+# Save full rows of df that match the non-missing cases in df_clust
+df_used <- df[complete.cases(df[, names(df_clust)]), ]
+
+# Standardize features
+clust_scaled <- scale(df_clust)
+
+# Elbow method for k = 2 to 20
+wss <- map_dbl(2:20, function(k) {
+  kmeans(clust_scaled, centers = k, nstart = 25)$tot.withinss
+})
+
+# Plot elbow curve
+plot(2:20, wss, type = "b", col = "blue", pch = 19,
+     main = "Elbow Method (All Numeric Features Excluding ID & Location)",
+     xlab = "Number of Clusters (k)", ylab = "Total Within-Cluster SS")
+
+# Standardize
+clust_scaled <- scale(df_clust)
+
+# Elbow method
+wss <- map_dbl(2:20, function(k){
+  kmeans(clust_scaled, centers = k, nstart = 25)$tot.withinss
+})
+plot(2:20, wss, type = "b", col = "blue", pch = 19, main = "Elbow Method")
+
+# Fit k-means
+set.seed(42)
+k3 <- kmeans(clust_scaled, centers = 3, nstart = 25)
+
+# Add clusters to filtered data only
+df_used$cluster <- factor(k3$cluster)
+```
+
+# Clusters by School Type and Borough
+
+```{r}
+ggplot(df_used, aes(x = school_type, fill = cluster)) +
+  geom_bar(position = "fill") +
+  labs(title = "Clusters by School Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(df_used, aes(x = borough, fill = cluster)) +
+  geom_bar(position = "fill") +
+  labs(title = "Clusters by Borough") +
+  theme(axis.text.x = element_text(angle = 90))
+
+ggplot(df_used, aes(x = factor(ofsted), fill = cluster)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Clusters by Ofsted Rating",
+    x = "Ofsted Rating",
+    y = "Proportion within Cluster",
+    fill = "Cluster"
+  ) +
+  theme_minimal()
+
+ggplot(df_used, aes(x = cluster, y = pct_attainment, fill = cluster)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    title = "Distribution of % Attainment by Cluster",
+    x = "Cluster",
+    y = "% Attainment"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Required libraries
+library(dplyr)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+
+# Select LSOA deprivation indicators
+lsoa_vars <- c("employment_score", "crime_score", "education_skills_score", "health_score", "income_score")
+
+# Filter and scale the data
+df_lsoa <- df %>%
+  select(all_of(lsoa_vars)) %>%
+  drop_na()
+
+lsoa_scaled <- scale(df_lsoa)
+
+# Run k-means clustering
+set.seed(42)
+k_lsoa <- kmeans(lsoa_scaled, centers = 3, nstart = 25)
+
+# PCA for visualization
+pca_lsoa <- prcomp(lsoa_scaled)
+pca_df <- as.data.frame(pca_lsoa$x[, 1:2])
+pca_df$original_cluster <- k_lsoa$cluster
+
+# Relabel clusters based on mean PC1
+cluster_means <- pca_df %>%
+  group_by(original_cluster) %>%
+  summarise(mean_PC1 = mean(PC1)) %>%
+  arrange(mean_PC1) %>%
+  mutate(new_cluster = as.character(row_number()))
+
+# Create mapping vector and apply new labels
+cluster_mapping <- setNames(cluster_means$new_cluster, cluster_means$original_cluster)
+pca_df$cluster <- cluster_mapping[as.character(pca_df$original_cluster)]
+
+# Add relabeled clusters back to the full dataset
+df$lsoa_cluster <- NA
+df$lsoa_cluster[complete.cases(df_lsoa)] <- cluster_mapping[as.character(k_lsoa$cluster)]
+
+# Plot clusters in PCA space
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.7) +
+  labs(
+    title = "LSOA Clusters in PCA Space (Relabeled by PC1)",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(sf)
+library(tidyverse)
+# Average LSOA cluster by borough
+
+# Set folder path
+shp_folder <- "london_boroughs"  # Adjust if needed
+
+# List only the .shp files
+shp_files <- list.files(shp_folder, pattern = "\\.shp$", full.names = TRUE)
+
+# Read and combine all shapefiles into one sf object
+borough_shapes <- map_df(shp_files, ~ {
+  st_read(.x, quiet = TRUE) %>%
+    mutate(borough = tools::file_path_sans_ext(basename(.x)))  # adds borough name from filename
+})
+
+# Clean borough name formatting
+borough_shapes$borough <- str_replace_all(borough_shapes$borough, "_", " ") %>%
+  str_to_title() %>% str_trim()
+
+# Group LSOA geometries into one polygon per borough
+borough_shapes_clean <- borough_shapes %>%
+  group_by(borough) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Compute average LSOA cluster per borough 
+
+# Ensure lsoa_cluster is numeric
+df <- df %>%
+  mutate(
+    lsoa_cluster_num = as.numeric(as.character(lsoa_cluster))
+  )
+
+# Calculate average cluster per borough
+cluster_by_borough <- df %>%
+  group_by(borough) %>%
+  summarise(avg_lsoa_cluster = mean(lsoa_cluster_num, na.rm = TRUE)) %>%
+  mutate(borough = str_to_title(str_trim(borough)))
+
+# Join spatial and school data 
+borough_map_data <- borough_shapes_clean %>%
+  left_join(cluster_by_borough, by = "borough")
+
+# Plot choropleth map 
+ggplot(borough_map_data) +
+  geom_sf(aes(fill = avg_lsoa_cluster), color = "white", size = 0.3) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80", name = "Avg LSOA Cluster") +
+  labs(
+    title = "Average LSOA Cluster per Borough"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+
+# Set folder path
+shp_folder <- "london_boroughs"
+
+# List only the .shp files
+shp_files <- list.files(shp_folder, pattern = "\\.shp$", full.names = TRUE)
+
+# Read and combine all shapefiles into one sf object
+borough_shapes <- map_df(shp_files, ~ {
+  st_read(.x, quiet = TRUE) %>%
+    mutate(borough = tools::file_path_sans_ext(basename(.x)))  # adds borough name from filename
+})
+
+# Clean borough name formatting
+borough_shapes$borough <- str_replace_all(borough_shapes$borough, "_", " ") %>%
+  str_to_title() %>% str_trim()
+
+# Group LSOA geometries into one polygon per borough
+borough_shapes_clean <- borough_shapes %>%
+  group_by(borough) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Compute average crime score per borough 
+crime_by_borough <- df %>%
+  group_by(borough) %>%
+  summarise(avg_crime_score = mean(crime_score, na.rm = TRUE)) %>%
+  mutate(borough = str_to_title(str_trim(borough)))
+
+# Join spatial and school data 
+borough_map_data <- borough_shapes_clean %>%
+  left_join(crime_by_borough, by = "borough")
+
+# Plot choropleth map 
+ggplot(borough_map_data) +
+  geom_sf(aes(fill = avg_crime_score), color = "white", size = 0.3) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80", name = "Avg Crime Score") +
+  labs(
+    title = "Average Crime Score per Borough"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+```
+
+```{r}
+# Set folder path
+shp_folder <- "london_boroughs"
+
+# List only the .shp files
+shp_files <- list.files(shp_folder, pattern = "\\.shp$", full.names = TRUE)
+
+# Read and combine all shapefiles into one sf object
+borough_shapes <- map_df(shp_files, ~ {
+  st_read(.x, quiet = TRUE) %>%
+    mutate(borough = tools::file_path_sans_ext(basename(.x)))  # adds borough name from filename
+})
+
+# Clean borough name formatting
+borough_shapes$borough <- str_replace_all(borough_shapes$borough, "_", " ") %>%
+  str_to_title() %>% str_trim()
+
+# Group LSOA geometries into one polygon per borough
+borough_shapes_clean <- borough_shapes %>%
+  group_by(borough) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Compute average education score per borough 
+education_by_borough <- df %>%
+  group_by(borough) %>%
+  summarise(avg_edu_score = mean(education_skills_score, na.rm = TRUE)) %>%
+  mutate(borough = str_to_title(str_trim(borough)))
+
+# Join spatial and school data  
+borough_map_data <- borough_shapes_clean %>%
+  left_join(education_by_borough, by = "borough")
+
+# Plot choropleth map 
+ggplot(borough_map_data) +
+  geom_sf(aes(fill = avg_edu_score), color = "white", size = 0.3) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80", name = "Avg Education Score") +
+  labs(
+    title = "Average Education Skills Score per Borough"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+# Set folder path
+shp_folder <- "london_boroughs"  
+
+# List only the .shp files
+shp_files <- list.files(shp_folder, pattern = "\\.shp$", full.names = TRUE)
+
+# Read and combine all shapefiles into one sf object
+borough_shapes <- map_df(shp_files, ~ {
+  st_read(.x, quiet = TRUE) %>%
+    mutate(borough = tools::file_path_sans_ext(basename(.x)))  # adds borough name from filename 
+})
+
+# Clean borough name formatting
+borough_shapes$borough <- str_replace_all(borough_shapes$borough, "_", " ") %>%
+  str_to_title() %>% str_trim()
+
+# Group LSOA geometries into one polygon per borough
+borough_shapes_clean <- borough_shapes %>% 
+  group_by(borough) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop") %>%
+  ungroup()
+
+# Compute average Ofsted rating per borough 
+# Ensure Ofsted is numeric before averaging
+df$ofsted <- as.numeric(as.character(df$ofsted))
+
+ofsted_by_borough <- df %>%
+  group_by(borough) %>%
+  summarise(avg_ofsted = mean(ofsted, na.rm = TRUE)) %>%
+  mutate(borough = str_to_title(str_trim(borough)))
+
+# Join spatial and school data   
+borough_map_data <- borough_shapes_clean %>%
+  left_join(ofsted_by_borough, by = "borough") %>%   
+  filter(borough != "City Of London")  # <- Exclude City of London
+
+# Plot choropleth map 
+ggplot(borough_map_data) +
+  geom_sf(aes(fill = avg_ofsted), color = "white", size = 0.3) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey80", name = "Avg Ofsted Rating") +
+  labs(
+    title = "Average Ofsted Rating per Borough"
+  ) +
+  theme_minimal() +  
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+```
+
+# Borderline Schools clustering
+```{r}
+
+# Load libraries
+library(dplyr)
+library(ggplot2)  
+library(scales)
+
+# Select key features
+features <- c("pct_attainment", "pct_absences", "ofsted", "pupils_per_teacher")
+    
+# Ensure complete cases for clustering
+df_cluster <- df %>%
+  select(all_of(features)) %>%
+  drop_na() %>%
+  mutate(across(everything(), as.numeric))
+
+# Standardize data
+df_scaled <- scale(df_cluster)
+
+# PCA
+pca <- prcomp(df_scaled)
+pca_df <- as.data.frame(pca$x[, 1:2])  # Use PC1 and PC2
+colnames(pca_df) <- c("PC1", "PC2")   
+
+# K-means clustering
+set.seed(42)
+kmeans_result <- kmeans(pca_df, centers = 3)
+pca_df$cluster <- factor(kmeans_result$cluster)
+
+# Calculate distance from cluster center
+centers <- kmeans_result$centers
+pca_df$dist_to_center <- sqrt(rowSums((pca_df[, c("PC1", "PC2")] - centers[pca_df$cluster, ])^2))
+
+#  Identify "transition schools"   
+# Define as top 15% furthest from cluster centers
+threshold <- quantile(pca_df$dist_to_center, 0.85)
+pca_df$transition <- ifelse(pca_df$dist_to_center > threshold, "Yes", "No")
+
+# Add back school names/IDs for reference
+pca_df$school_id <- rownames(df_cluster)  # Or use df$school_name if available
+     
+# Plot PCA with transition schools highlighted
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster, shape = transition)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  scale_shape_manual(values = c("No" = 16, "Yes" = 17)) +  # Triangle for transition
+  labs(
+    title = "PCA of School Metrics with Transition Schools Highlighted",
+    subtitle = "Transition schools = top 15% furthest from cluster centers",
+    color = "Cluster", shape = "Transition School"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+#Select and scale features
+df_cluster <- df %>%
+  select(all_of(features)) %>%  
+  drop_na() %>%
+  mutate(across(everything(), as.numeric))
+
+df_scaled <- scale(df_cluster)     
+
+# Run PCA
+pca_transition <- prcomp(df_scaled, center = TRUE, scale. = TRUE)
+
+# View variance explained
+summary(pca_transition)
+
+# View and interpret loadings
+loadings <- pca_transition$rotation
+print(loadings)
+
+
+```
+
+
+# Dimensionality Reduction (PCA and t-SNE)
+
+```{r}
+# PCA
+pca <- prcomp(clust_scaled)
+pca_df <- as.data.frame(pca$x[, 1:2])
+pca_df$cluster <- df_used$cluster    
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.7) +  
+  labs(title = "Clusters in PCA Space")
+
+# t-SNE
+tsne <- Rtsne(clust_scaled, dims = 2, perplexity = 30)
+tsne_df <- as.data.frame(tsne$Y)
+tsne_df$cluster <- df_used$cluster
+
+ggplot(tsne_df, aes(x = V1, y = V2, color = cluster)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "t-SNE of Clusters")
+
+```
